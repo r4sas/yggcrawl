@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"reflect"
 	"sync"
@@ -59,7 +60,7 @@ func main() {
 	n.config.SessionFirewall.AlwaysAllowOutbound = false
 
 	n.core.Start(n.config, n.log)
-	n.core.AddPeer("tcp://edinburgh.psg.neilalexander.dev:54321", "")
+	n.core.AddPeer("tcp://localhost:12345", "")
 
 	fmt.Println("Waiting for DHT bootstrap")
 	for {
@@ -118,6 +119,7 @@ func main() {
 
 func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 	defer n.dhtWaitGroup.Done()
+	time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
 
 	n.dhtMutex.RLock()
 	if info, ok := n.dhtVisited[pubkey]; (ok && reflect.DeepEqual(coords, info.coords)) || info.found {
@@ -164,6 +166,7 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 
 func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
 	defer n.nodeInfoWaitGroup.Done()
+	time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
 
 	nodeid := hex.EncodeToString(pubkey[:])
 

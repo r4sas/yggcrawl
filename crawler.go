@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"os"
 	"reflect"
 	"sync"
@@ -73,15 +72,14 @@ func main() {
 
 	starttime := time.Now()
 
-	var pubkey crypto.BoxPubKey
 	if key, err := hex.DecodeString(n.core.EncryptionPublicKey()); err == nil {
+		var pubkey crypto.BoxPubKey
 		copy(pubkey[:], key)
+		n.dhtWaitGroup.Add(1)
 		go n.dhtPing(pubkey, n.core.Coords())
 	} else {
 		panic("failed to decode pub key")
 	}
-
-	time.Sleep(time.Second)
 
 	n.dhtWaitGroup.Wait()
 	n.nodeInfoWaitGroup.Wait()
@@ -119,7 +117,6 @@ func main() {
 }
 
 func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
-	n.dhtWaitGroup.Add(1)
 	defer n.dhtWaitGroup.Done()
 
 	n.dhtMutex.RLock()
@@ -136,7 +133,6 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 	}
 	n.dhtMutex.Unlock()
 
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(10000)))
 	res, err := n.core.DHTPing(
 		pubkey,
 		coords,
@@ -149,6 +145,7 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 		found:  err == nil,
 	}
 	if n.dhtVisited[pubkey].found {
+		n.nodeInfoWaitGroup.Add(1)
 		go n.nodeInfo(pubkey, coords)
 	} else {
 		n.dhtMutex.Unlock()
@@ -157,16 +154,15 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 
 	n.dhtMutex.Unlock()
 	n.dhtMutex.RLock()
-	defer time.Sleep(time.Second)
 	defer n.dhtMutex.RUnlock()
 
 	for _, info := range res.Infos {
+		n.dhtWaitGroup.Add(1)
 		go n.dhtPing(info.PublicKey, info.Coords)
 	}
 }
 
 func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
-	n.nodeInfoWaitGroup.Add(1)
 	defer n.nodeInfoWaitGroup.Done()
 
 	nodeid := hex.EncodeToString(pubkey[:])
@@ -178,7 +174,6 @@ func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
 	}
 	n.nodeInfoMutex.RUnlock()
 
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(10000)))
 	res, err := n.core.GetNodeInfo(pubkey, coords, false)
 	if err != nil {
 		return

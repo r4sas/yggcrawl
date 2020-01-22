@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
-	"reflect"
 	"sync"
 	"time"
 
@@ -16,6 +15,8 @@ import (
 	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 	"github.com/yggdrasil-network/yggdrasil-go/src/yggdrasil"
 )
+
+const retryCount = 5
 
 type node struct {
 	core              yggdrasil.Core
@@ -119,44 +120,46 @@ func main() {
 
 func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 	defer n.dhtWaitGroup.Done()
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
 
 	n.dhtMutex.RLock()
-	if info, ok := n.dhtVisited[pubkey]; (ok && reflect.DeepEqual(coords, info.coords)) || info.found {
+	if info := n.dhtVisited[pubkey]; info.found {
 		n.dhtMutex.RUnlock()
 		return
 	}
 	n.dhtMutex.RUnlock()
 
-	n.dhtMutex.Lock()
-	n.dhtVisited[pubkey] = attempt{
-		coords: coords,
-		found:  false,
+	var res yggdrasil.DHTRes
+	var err error
+	for idx := 0; idx < retryCount; idx++ {
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)*(1<<idx)))
+		res, err = n.core.DHTPing(
+			pubkey,
+			coords,
+			&crypto.NodeID{},
+		)
+		if err == nil {
+			break
+		}
 	}
-	n.dhtMutex.Unlock()
 
-	res, err := n.core.DHTPing(
-		pubkey,
-		coords,
-		&crypto.NodeID{},
-	)
-
-	n.dhtMutex.Lock()
-	n.dhtVisited[pubkey] = attempt{
+	info := attempt{
 		coords: res.Coords,
 		found:  err == nil,
 	}
-	if n.dhtVisited[pubkey].found {
+
+	n.dhtMutex.Lock()
+	defer n.dhtMutex.Unlock()
+	oldInfo := n.dhtVisited[pubkey]
+	if info.found || !oldInfo.found {
+		n.dhtVisited[pubkey] = info
+	}
+
+	if !oldInfo.found && info.found {
 		n.nodeInfoWaitGroup.Add(1)
 		go n.nodeInfo(pubkey, coords)
 	} else {
-		n.dhtMutex.Unlock()
 		return
 	}
-
-	n.dhtMutex.Unlock()
-	n.dhtMutex.RLock()
-	defer n.dhtMutex.RUnlock()
 
 	for _, info := range res.Infos {
 		n.dhtWaitGroup.Add(1)
@@ -166,7 +169,6 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 
 func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
 	defer n.nodeInfoWaitGroup.Done()
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
 
 	nodeid := hex.EncodeToString(pubkey[:])
 
@@ -177,7 +179,16 @@ func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
 	}
 	n.nodeInfoMutex.RUnlock()
 
-	res, err := n.core.GetNodeInfo(pubkey, coords, false)
+	var res yggdrasil.NodeInfoPayload
+	var err error
+	for idx := 0; idx < retryCount; idx++ {
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)*(1<<idx)))
+		res, err = n.core.GetNodeInfo(pubkey, coords, false)
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
 		return
 	}

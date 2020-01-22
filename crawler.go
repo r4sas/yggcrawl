@@ -61,7 +61,7 @@ func main() {
 	n.config.SessionFirewall.AlwaysAllowOutbound = false
 
 	n.core.Start(n.config, n.log)
-	n.core.AddPeer("tcp://localhost:12345", "")
+	n.core.AddPeer("tcp://edinburgh.psg.neilalexander.dev:54321", "")
 
 	fmt.Println("Waiting for DHT bootstrap")
 	for {

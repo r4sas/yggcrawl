@@ -25,7 +25,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"reflect"
 	"sync"
 	"time"
 
@@ -39,6 +38,7 @@ import (
 var defaultPeer = flag.String("peer", "", "static peer to use, e.g. tcp://host:port")
 var defaultFilename = flag.String("file", "results.json", "filename to write results to")
 var defaultAdminSocket = flag.String("admin", "none", "admin socket path, e.g. unix:///var/run/yggcrawl.sock")
+var defaultRetryCount = flag.Int("retry", 5, "number of retry attempts (with random exponential backoff starting at 1s)")
 
 type node struct {
 	core              yggdrasil.Core
@@ -119,15 +119,14 @@ func main() {
 	fmt.Println("Our network coords are", n.core.Coords())
 	fmt.Println("Starting crawl")
 
-	var pubkey crypto.BoxPubKey
 	if key, err := hex.DecodeString(n.core.EncryptionPublicKey()); err == nil {
+		var pubkey crypto.BoxPubKey
 		copy(pubkey[:], key)
+		n.dhtWaitGroup.Add(1)
 		go n.dhtPing(pubkey, n.core.Coords())
 	} else {
 		panic("failed to decode pub key")
 	}
-
-	time.Sleep(time.Second)
 
 	n.dhtWaitGroup.Wait()
 	n.nodeInfoWaitGroup.Wait()
@@ -177,9 +176,7 @@ func main() {
 }
 
 func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
-	// Notify the main goroutine that we're working and to wait for us to complete
-	// before finishing the process
-	n.dhtWaitGroup.Add(1)
+	// Notify the main goroutine that we're done working
 	defer n.dhtWaitGroup.Done()
 
 	// Generate useful information about the node, such as it's node ID, address
@@ -194,7 +191,7 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 	// doing - it either means that a search is already taking place, or that we
 	// have already processed this node
 	n.dhtMutex.RLock()
-	if info, ok := n.dhtVisited[key]; (ok && reflect.DeepEqual(coords, info.Coords)) || info.Found {
+	if info := n.dhtVisited[key]; info.Found {
 		n.dhtMutex.RUnlock()
 		return
 	}
@@ -202,30 +199,24 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 
 	// Make a record of this node and the coordinates so that future goroutines
 	// started by a rumour of this node will not repeat this search
-	n.dhtMutex.Lock()
-	n.dhtVisited[key] = attempt{
-		Coords: coords,
-		Found:  false,
-	}
-	n.dhtMutex.Unlock()
-
-	// Send out a DHT ping request into the network
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(10000)))
-	res, err := n.core.DHTPing(
-		pubkey,
-		coords,
-		&crypto.NodeID{},
-	)
-
-	// If the result coordinates received back from the DHT ping don't match the
-	// coordinates we were provided, update them
-	if res.Coords != nil {
-		coords = res.Coords
+	var res yggdrasil.DHTRes
+	var err error
+	for idx := 0; idx < *defaultRetryCount; idx++ {
+		// Randomized delay between attempts, increases exponentially
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)*(1<<idx)))
+		// Send out a DHT ping request into the network
+		res, err = n.core.DHTPing(
+			pubkey,
+			coords,
+			&crypto.NodeID{},
+		)
+		if err == nil {
+			break
+		}
 	}
 
 	// Write our new information into the list of visited DHT nodes
-	n.dhtMutex.Lock()
-	n.dhtVisited[key] = attempt{
+	info := attempt{
 		NodeID:     nodeid.String(),
 		IPv6Addr:   addr.String(),
 		IPv6Subnet: subnet.String(),
@@ -233,32 +224,33 @@ func (n *node) dhtPing(pubkey crypto.BoxPubKey, coords []uint64) {
 		Found:      err == nil,
 	}
 
-	// If we successfully found the node then try to start another goroutine that
-	// will request nodeinfo for the node
-	if n.dhtVisited[key].Found {
-		go n.nodeInfo(pubkey, coords)
-	} else {
-		n.dhtMutex.Unlock()
-		return
+	// If we successfully found the node then update dhtVisited to say so
+	n.dhtMutex.Lock()
+	defer n.dhtMutex.Unlock()
+	oldInfo := n.dhtVisited[key]
+	if info.Found || !oldInfo.Found {
+		n.dhtVisited[key] = info
 	}
 
-	// Clean up a bit
-	n.dhtMutex.Unlock()
-	n.dhtMutex.RLock()
-	defer time.Sleep(time.Second)
-	defer n.dhtMutex.RUnlock()
+	// If this was the first response from this node then request nodeinfo
+	if !oldInfo.Found && info.Found {
+		n.nodeInfoWaitGroup.Add(1)
+		go n.nodeInfo(pubkey, coords)
+	} else {
+		// This isn't our first response from the node, so don't do anything
+		return
+	}
 
 	// Start new DHT search goroutines based on the rumours included in the DHT
 	// ping response
 	for _, info := range res.Infos {
+		n.dhtWaitGroup.Add(1)
 		go n.dhtPing(info.PublicKey, info.Coords)
 	}
 }
 
 func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
-	// Notify the main goroutine that we're working and to wait for us to complete
-	// before finishing the process
-	n.nodeInfoWaitGroup.Add(1)
+	// Notify the main goroutine that we're done working
 	defer n.nodeInfoWaitGroup.Done()
 
 	// Store information that says that we attempted to query this node for
@@ -271,10 +263,16 @@ func (n *node) nodeInfo(pubkey crypto.BoxPubKey, coords []uint64) {
 	}
 	n.nodeInfoMutex.RUnlock()
 
-	// Wait for a random amount of time (to reduce load) and then send the
-	// nodeinfo request to the given coordinates
-	time.Sleep(time.Millisecond * time.Duration(rand.Intn(10000)))
-	res, err := n.core.GetNodeInfo(pubkey, coords, false)
+	// send the nodeinfo request to the given coordinates
+	var res yggdrasil.NodeInfoPayload
+	var err error
+	for idx := 0; idx < *defaultRetryCount; idx++ {
+		time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)*(1<<idx)))
+		res, err = n.core.GetNodeInfo(pubkey, coords, false)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return
 	}

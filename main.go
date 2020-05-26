@@ -32,16 +32,20 @@ import (
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/config"
 	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
+	"github.com/yggdrasil-network/yggdrasil-go/src/multicast"
 	"github.com/yggdrasil-network/yggdrasil-go/src/yggdrasil"
 )
 
 var defaultPeer = flag.String("peer", "", "static peer to use, e.g. tcp://host:port")
+var defaultMulticast = flag.Bool("multicast", false, "whether to enable multicast peering")
 var defaultFilename = flag.String("file", "results.json", "filename to write results to")
 var defaultAdminSocket = flag.String("admin", "none", "admin socket path, e.g. unix:///var/run/yggcrawl.sock")
 var defaultRetryCount = flag.Int("retry", 5, "number of retry attempts (with random exponential backoff starting at 1s)")
 
 type node struct {
 	core              yggdrasil.Core
+	multicast         multicast.Multicast
+	state             config.NodeState
 	config            *config.NodeConfig
 	log               *log.Logger
 	dhtWaitGroup      sync.WaitGroup
@@ -55,12 +59,13 @@ type node struct {
 // This is the structure that we marshal at the end into JSON results
 type results struct {
 	Meta struct {
-		GeneratedAtUTC     int64 `json:"generated_at_utc"`
-		NodesAttempted     int   `json:"nodes_attempted"`
-		NodesSuccessful    int   `json:"nodes_successful"`
-		NodesFailed        int   `json:"nodes_failed"`
-		NodeInfoSuccessful int   `json:"nodeinfo_successful"`
-		NodeInfoFailed     int   `json:"nodeinfo_failed"`
+		GeneratedAtUTC     int64   `json:"generated_at_utc"`
+		TimeTaken          float64 `json:"crawl_time_seconds"`
+		NodesAttempted     int     `json:"nodes_attempted"`
+		NodesSuccessful    int     `json:"nodes_successful"`
+		NodesFailed        int     `json:"nodes_failed"`
+		NodeInfoSuccessful int     `json:"nodeinfo_successful"`
+		NodeInfoFailed     int     `json:"nodeinfo_failed"`
 	} `json:"meta"`
 	Topology *map[string]attempt     `json:"topology"`
 	NodeInfo *map[string]interface{} `json:"nodeinfo"`
@@ -82,8 +87,8 @@ func main() {
 		log:    log.New(os.Stdout, "", log.Flags()),
 	}
 
-	if *defaultPeer == "" {
-		fmt.Println("No peer has been specified, see --help")
+	if *defaultPeer == "" && *defaultMulticast == false {
+		fmt.Println("No peer has been specified, see -help")
 		return
 	}
 
@@ -98,14 +103,36 @@ func main() {
 	n.config.SessionFirewall.AllowFromDirect = false
 	n.config.SessionFirewall.AllowFromRemote = false
 	n.config.SessionFirewall.AlwaysAllowOutbound = false
-
 	n.core.Start(n.config, n.log)
-	if err := n.core.AddPeer(*defaultPeer, ""); err != nil {
-		fmt.Println("Failed to connect to peer:", err)
-		return
+
+	if *defaultPeer != "" {
+		if err := n.core.CallPeer(*defaultPeer, ""); err != nil {
+			fmt.Println("Failed to connect to peer:", err)
+			return
+		}
 	}
 
-	fmt.Println("Connected to", *defaultPeer)
+	if *defaultMulticast {
+		if err := n.multicast.Init(&n.core, &n.state, n.log, nil); err != nil {
+			log.Errorln("An error occurred initialising multicast:", err)
+			return
+		}
+		if err := n.multicast.Start(); err != nil {
+			log.Errorln("An error occurred starting multicast:", err)
+			return
+		}
+		fmt.Println("Multicast is enabled on", len(n.multicast.Interfaces()), "interface(s)")
+	}
+
+	fmt.Println("Waiting for peers")
+	for {
+		if len(n.core.GetSwitchPeers()) > 0 {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	fmt.Println("Connected to", len(n.core.GetSwitchPeers()), "peer(s)")
+
 	fmt.Println("Waiting for DHT bootstrap")
 	for {
 		if len(n.core.GetDHT()) > 3 {
@@ -150,6 +177,7 @@ func main() {
 		NodeInfo: &n.nodeInfoVisited,
 	}
 	res.Meta.GeneratedAtUTC = time.Now().UTC().Unix()
+	res.Meta.TimeTaken = time.Since(starttime).Seconds()
 	res.Meta.NodeInfoSuccessful = len(n.nodeInfoVisited)
 	res.Meta.NodeInfoFailed = found - len(n.nodeInfoVisited)
 	res.Meta.NodesAttempted = attempted
